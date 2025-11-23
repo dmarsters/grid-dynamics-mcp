@@ -1,22 +1,23 @@
 """
 Grid Dynamics MCP Server
-Analyzes image compositional structure and mood, proposes alignments, and synthesizes enhanced prompts.
+Analyzes compositional structure and mood, proposes alignments, and synthesizes enhanced prompts.
 Three-layer olog architecture: Domain → Interpretation → Synthesis
+
+STATELESS DESIGN: This MCP receives pre-extracted structural and mood parameters
+(from Claude's vision model or other sources) and performs deterministic alignment 
+proposal + synthesis. Claude orchestrates the image analysis; Grid Dynamics handles 
+the interpretation and synthesis layers.
 """
 
-import base64
 import json
-from pathlib import Path
-from typing import Optional, Literal
+from typing import Optional
 from dataclasses import dataclass, asdict
 from enum import Enum
 
 from fastmcp import FastMCP
-from anthropic import Anthropic
 
 # Initialize FastMCP server
 mcp = FastMCP("grid-dynamics")
-client = Anthropic()
 
 
 # ============================================================================
@@ -81,173 +82,7 @@ class ExtractionResult:
     editable: bool = True
 
 
-# ============================================================================
-# LAYER 2: Interpretation (Deterministic Extraction via Vision)
-# ============================================================================
 
-def image_to_base64(image_path: str) -> str:
-    """Convert image file to base64 string"""
-    with open(image_path, "rb") as img_file:
-        return base64.standard_b64encode(img_file.read()).decode("utf-8")
-
-
-def extract_structural_analysis(image_base64: str) -> StructuralAnalysis:
-    """
-    Structural Extractor functor: Vision model analyzes compositional elements
-    Returns deterministic structural parameters
-    """
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=1000,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_base64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": """Analyze this image's compositional structure. Return JSON with these exact parameters (0-1 scale):
-
-{
-  "edge_tension": <float>,
-  "asymmetric_balance": <float>,
-  "negative_space": <float>,
-  "rhythm": <float>,
-  "density": <float>,
-  "scale_hierarchy": <float>,
-  "diagonal_dominance": <float>,
-  "containment": <float>,
-  "summary": "<natural language description of overall structure>"
-}
-
-Definitions:
-- edge_tension: How much subjects crowd frame boundaries (0=centered, 1=cramped edges)
-- asymmetric_balance: Weight distribution evenness (0=balanced, 1=heavily weighted)
-- negative_space: Breathing room (0=generous whitespace, 1=compressed/crowded)
-- rhythm: Repetition pattern regularity (0=regular grid, 1=chaotic variation)
-- density: Element count and saturation (0=sparse/minimal, 1=overflowing)
-- scale_hierarchy: Size variation dominance (0=uniform sizes, 1=clear dominant element)
-- diagonal_dominance: Diagonal line prevalence (0=horizontal/vertical, 1=strong diagonals)
-- containment: Elements within frame (0=contained, 1=bleeding/cropped)
-
-Return ONLY valid JSON.""",
-                    },
-                ],
-            }
-        ],
-    )
-
-    # Parse Claude's JSON response
-    json_str = response.content[0].text
-    data = json.loads(json_str)
-
-    return StructuralAnalysis(
-        edge_tension=data["edge_tension"],
-        asymmetric_balance=data["asymmetric_balance"],
-        negative_space=data["negative_space"],
-        rhythm=data["rhythm"],
-        density=data["density"],
-        scale_hierarchy=data["scale_hierarchy"],
-        diagonal_dominance=data["diagonal_dominance"],
-        containment=data["containment"],
-        summary=data["summary"],
-    )
-
-
-def extract_mood_analysis(image_base64: str) -> MoodAnalysis:
-    """
-    Mood Extractor functor: Vision model analyzes emotional/sensory qualities
-    Returns deterministic mood dimensions
-    """
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=1000,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_base64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": """Analyze this image's emotional and sensory mood. Return JSON with sentiment dimensions (0-1 scale):
-
-{
-  "dimensions": {
-    "melancholy": <float>,
-    "intimacy": <float>,
-    "tension": <float>,
-    "stillness": <float>,
-    "energy": <float>,
-    "warmth": <float>,
-    "unease": <float>
-  },
-  "summary": "<natural language description of overall mood>"
-}
-
-Scale: 0 = absent/minimal, 1 = dominant/intense
-
-Return ONLY valid JSON.""",
-                    },
-                ],
-            }
-        ],
-    )
-
-    json_str = response.content[0].text
-    data = json.loads(json_str)
-
-    return MoodAnalysis(
-        dimensions=data["dimensions"],
-        summary=data["summary"],
-    )
-
-
-def parse_seed_text(seed_text: str) -> SeedInterpretation:
-    """
-    Seed Parser: Extract subject matter and intent from seed text
-    """
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=200,
-        messages=[
-            {
-                "role": "user",
-                "content": f"""Parse this seed text into subject and intent:
-
-Seed: "{seed_text}"
-
-Return JSON:
-{{
-  "subject": "<what is being depicted>",
-  "intent": "<creative or emotional intent>"
-}}
-
-Return ONLY valid JSON.""",
-            }
-        ],
-    )
-
-    json_str = response.content[0].text
-    data = json.loads(json_str)
-
-    return SeedInterpretation(
-        subject=data["subject"],
-        intent=data["intent"],
-    )
 
 
 def propose_alignment(
@@ -256,53 +91,75 @@ def propose_alignment(
     seed: Optional[SeedInterpretation],
 ) -> AlignmentProposal:
     """
-    Alignment Proposal: Rule-based + lightweight inference to suggest how
-    structure, mood, and seed interact expressively
+    Alignment Proposal: Deterministic rule-based inference.
+    Suggests how structure, mood, and seed interact expressively.
+    
+    Rules:
+    - If structure and mood align (high/low in same direction): REINFORCING
+    - If structure and mood oppose (one high, one low): CONTRASTING or PRODUCTIVE_TENSION
+    - If seed intent conflicts with mood: PRODUCTIVE_TENSION
     """
-    # Build context for Claude
-    context = f"""
-Structural Analysis:
-{structural.summary}
-Values: edge_tension={structural.edge_tension:.2f}, negative_space={structural.negative_space:.2f}, 
-density={structural.density:.2f}, diagonal_dominance={structural.diagonal_dominance:.2f}
-
-Mood Analysis:
-{mood.summary}
-Dimensions: {json.dumps(mood.dimensions, indent=2)}
-"""
-
+    conflicts = []
+    
+    # Rule 1: Detect structural-mood alignment
+    high_energy_structure = (structural.diagonal_dominance > 0.6 or 
+                             structural.rhythm > 0.6)
+    low_energy_structure = (structural.diagonal_dominance < 0.4 and 
+                            structural.rhythm < 0.4)
+    
+    high_energy_mood = mood.dimensions.get("energy", 0) > 0.6
+    low_energy_mood = mood.dimensions.get("energy", 0) < 0.4
+    
+    structural_compressed = structural.negative_space > 0.6
+    mood_uneasy = mood.dimensions.get("unease", 0) > 0.5
+    
+    # Rule 2: Check seed intent vs mood
+    has_intent_conflict = False
     if seed:
-        context += f"""
-Seed Intent:
-Subject: {seed.subject}
-Intent: {seed.intent}
-"""
-
-    prompt = f"""{context}
-
-Propose how these elements interact expressively. Return JSON:
-
-{{
-  "relationship_type": "<reinforcing|contrasting|productive_tension>",
-  "register_description": "<evocative combined mood, e.g. 'claustrophobic tenderness'>",
-  "conflicts": [<list of detected tensions between elements, e.g. "melancholic mood contradicts celebratory intent">]
-}}
-
-Be specific about compositional-emotional resonance. Return ONLY valid JSON."""
-
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    json_str = response.content[0].text
-    data = json.loads(json_str)
-
+        celebratory_intent = any(word in seed.intent.lower() 
+                                 for word in ["celebr", "joyful", "happy", "festive", "fun"])
+        melancholic_mood = mood.dimensions.get("melancholy", 0) > 0.5
+        
+        if celebratory_intent and melancholic_mood:
+            conflicts.append("Melancholic mood contradicts celebratory intent")
+            has_intent_conflict = True
+        
+        lonely_intent = any(word in seed.intent.lower() 
+                            for word in ["lone", "isolat", "alone"])
+        warm_mood = mood.dimensions.get("warmth", 0) > 0.6
+        
+        if lonely_intent and warm_mood:
+            conflicts.append("Warm mood contradicts isolated intent")
+    
+    # Rule 3: Check structural-mood tension
+    if structural_compressed and mood_uneasy:
+        conflicts.append("Structural compression amplifies emotional unease")
+    
+    if high_energy_structure and high_energy_mood:
+        relationship = AlignmentType.REINFORCING
+        register = "kinetic and dynamic"
+    elif low_energy_structure and low_energy_mood:
+        relationship = AlignmentType.REINFORCING
+        register = "still and contained"
+    elif (high_energy_structure and low_energy_mood) or (low_energy_structure and high_energy_mood):
+        relationship = AlignmentType.CONTRASTING
+        register = "contradictory visual-emotional tension"
+    else:
+        relationship = AlignmentType.PRODUCTIVE_TENSION
+        register = "compositionally complex"
+    
+    # If we have conflicts, upgrade to productive tension (where applicable)
+    if conflicts and relationship != AlignmentType.REINFORCING:
+        relationship = AlignmentType.PRODUCTIVE_TENSION
+    
+    # Add seed-based register if available
+    if seed and has_intent_conflict:
+        register = f"{ seed.intent.lower()} shadowed by melancholy"
+    
     return AlignmentProposal(
-        relationship_type=AlignmentType(data["relationship_type"]),
-        register_description=data["register_description"],
-        conflicts=data["conflicts"],
+        relationship_type=relationship,
+        register_description=register,
+        conflicts=conflicts,
     )
 
 
@@ -318,80 +175,162 @@ def synthesize_prompt(
     target_length: PromptLength = PromptLength.MEDIUM,
 ) -> str:
     """
-    Synthesis: Single LLM call to produce compositionally-aware enhanced prompt
-    Receives user-approved interpretation layer objects
+    Synthesis: Deterministic function that translates structural and mood parameters
+    into compositional prompt language.
+    
+    Uses rules-based parameter-to-language mapping rather than LLM generation
+    to maintain reproducibility and control.
     """
-    length_guide = {
-        PromptLength.SHORT: "1-2 sentences, concise",
-        PromptLength.MEDIUM: "3-4 sentences, balanced detail",
-        PromptLength.DETAILED: "5-7 sentences, comprehensive",
-    }
+    
+    # Extract key values
+    edge_tension = structural_values.get("edge_tension", 0.5)
+    negative_space = structural_values.get("negative_space", 0.5)
+    density = structural_values.get("density", 0.5)
+    diagonal_dominance = structural_values.get("diagonal_dominance", 0.5)
+    rhythm = structural_values.get("rhythm", 0.5)
+    containment = structural_values.get("containment", 0.5)
+    
+    melancholy = mood_values.get("melancholy", 0.5)
+    intimacy = mood_values.get("intimacy", 0.5)
+    energy = mood_values.get("energy", 0.5)
+    warmth = mood_values.get("warmth", 0.5)
+    tension = mood_values.get("tension", 0.5)
+    
+    # Build compositional language from parameters
+    parts = []
+    
+    # Spatial/containment description
+    if negative_space > 0.7:
+        parts.append("Frame with generous negative space, allowing subjects to breathe")
+    elif negative_space > 0.4:
+        parts.append("Compose with moderate spacing between elements")
+    else:
+        parts.append("Create a compressed composition with subjects clustered tightly")
+    
+    # Edge tension description
+    if edge_tension > 0.7:
+        parts.append("Position subjects crowding frame edges, creating visual tension")
+    elif edge_tension > 0.4:
+        parts.append("Place elements with moderate edge presence")
+    else:
+        parts.append("Center subjects with breathing room from frame boundaries")
+    
+    # Diagonal/rhythm description
+    if diagonal_dominance > 0.7:
+        parts.append("Use strong diagonal lines to create dynamic movement and visual urgency")
+    elif diagonal_dominance > 0.3:
+        parts.append("Mix diagonal and horizontal-vertical lines for balanced composition")
+    else:
+        parts.append("Emphasize horizontal and vertical lines for stability and order")
+    
+    # Rhythm/regularity
+    if rhythm > 0.7:
+        parts.append("Create irregular, chaotic rhythm with unpredictable element placement")
+    elif rhythm > 0.3:
+        parts.append("Establish moderate rhythm balancing pattern and variation")
+    else:
+        parts.append("Maintain regular, predictable rhythm and repetition")
+    
+    # Emotional tone from mood
+    if warmth > 0.6:
+        parts.append("Use warm tones and soft lighting to create comfort")
+    elif warmth < 0.4:
+        parts.append("Employ cool tones and harsh lighting for distance")
+    
+    if intimacy > 0.6:
+        parts.append("Frame with close proximity, making the scene feel personal and immediate")
+    elif intimacy < 0.4:
+        parts.append("Distance the viewer from subjects for objectivity")
+    
+    if energy > 0.7:
+        parts.append("Infuse the scene with kinetic motion and palpable momentum")
+    elif energy < 0.3:
+        parts.append("Emphasize stillness and quiet presence")
+    
+    if melancholy > 0.6:
+        parts.append("Let a melancholic undertone permeate the image, suggesting impermanence")
+    elif melancholy > 0.3:
+        parts.append("Introduce subtle sadness or nostalgia")
+    
+    if tension > 0.6:
+        parts.append("Create palpable visual tension that unsettles the viewer")
+    elif tension < 0.3:
+        parts.append("Establish harmony and visual resolution")
+    
+    # Combine with register description if provided
+    register_phrase = alignment_override or "the compositional-emotional interaction"
+    parts.insert(0, f"Create an image that embodies {register_phrase}.")
+    
+    # Join based on target length
+    if target_length == PromptLength.SHORT:
+        # Take first 2-3 parts
+        prompt = " ".join(parts[:3])
+    elif target_length == PromptLength.DETAILED:
+        # Use all parts
+        prompt = " ".join(parts)
+    else:  # MEDIUM
+        # Use 4-5 parts
+        prompt = " ".join(parts[:5])
+    
+    # Add seed context if provided
+    if seed_text:
+        prompt += f" The subject is {seed_text}."
+    
+    return prompt
 
-    prompt = f"""Generate an enhanced image generation prompt based on these compositional intentions:
-
-Structural Parameters:
-{json.dumps(structural_values, indent=2)}
-
-Mood Parameters:
-{json.dumps(mood_values, indent=2)}
-
-Target Register: {alignment_override or "natural composition of mood and structure"}
-{"Seed Context: " + seed_text if seed_text else ""}
-
-Write compositional direction that:
-1. Translates numerical values to natural language aesthetic guidance
-2. Shows how structure and mood work together
-3. Instructs an image generator on compositional choices
-4. Reconciles any tensions toward expressive coherence
-
-Length: {length_guide[target_length]}
-
-Return ONLY the enhanced prompt text, no JSON or explanation."""
-
-    response = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    return response.content[0].text.strip()
-
-
-# ============================================================================
-# Testable Core Functions
-# ============================================================================
 
 def extract_impl(
-    image_path: str,
+    structural_values: dict,
+    mood_values: dict,
     seed_text: Optional[str] = None,
 ) -> dict:
     """
     Core extraction implementation (testable).
-    Extract compositional structure and mood from image.
+    Receives pre-extracted structural and mood parameters (from Claude's vision model)
+    and performs alignment proposal + conflict detection.
+    
+    This MCP is STATELESS—Claude handles image analysis, Grid Dynamics handles
+    Layer 2 interpretation (alignment proposal) and Layer 3 synthesis.
     
     Args:
-        image_path: Path to image file (<10MB)
+        structural_values: Dict with structural parameters (8 keys, values 0-1)
+        mood_values: Dict with mood dimensions (7 keys, values 0-1)
         seed_text: Optional seed text describing subject/intent
     
     Returns:
         Dictionary with structural_analysis, mood_analysis, proposed_alignment,
         and editable flag set to true for user modification
     """
-    # Convert image to base64
-    image_b64 = image_to_base64(image_path)
-
-    # Layer 2: Extract structure and mood in parallel
-    structural = extract_structural_analysis(image_b64)
-    mood = extract_mood_analysis(image_b64)
-
+    # Reconstruct dataclasses from input dictionaries
+    structural = StructuralAnalysis(
+        edge_tension=structural_values.get("edge_tension", 0.5),
+        asymmetric_balance=structural_values.get("asymmetric_balance", 0.5),
+        negative_space=structural_values.get("negative_space", 0.5),
+        rhythm=structural_values.get("rhythm", 0.5),
+        density=structural_values.get("density", 0.5),
+        scale_hierarchy=structural_values.get("scale_hierarchy", 0.5),
+        diagonal_dominance=structural_values.get("diagonal_dominance", 0.5),
+        containment=structural_values.get("containment", 0.5),
+        summary=structural_values.get("summary", "Compositional analysis from Claude")
+    )
+    
+    mood = MoodAnalysis(
+        dimensions=mood_values,
+        summary=mood_values.get("summary", "Mood analysis from Claude")
+    )
+    
     # Parse seed if provided
     seed_interp = None
     if seed_text:
-        seed_interp = parse_seed_text(seed_text)
-
-    # Propose alignment
+        # Simple inline seed parsing (no Claude call)
+        seed_interp = SeedInterpretation(
+            subject=seed_text.split(',')[0].strip() if ',' in seed_text else seed_text,
+            intent=seed_text.split(',')[1].strip() if ',' in seed_text else "aesthetic intent"
+        )
+    
+    # Layer 2: Propose alignment (deterministic rule-based)
     alignment = propose_alignment(structural, mood, seed_interp)
-
+    
     result = ExtractionResult(
         structural_analysis=structural,
         mood_analysis=mood,
@@ -399,7 +338,7 @@ def extract_impl(
         proposed_alignment=alignment,
         editable=True,
     )
-
+    
     # Convert to dict for JSON serialization
     return {
         "structural_analysis": {
@@ -467,74 +406,39 @@ def synthesize_impl(
     }
 
 
-def analyze_and_synthesize_impl(
-    image_path: str,
-    seed_text: Optional[str] = None,
-    auto_approve: bool = False,
-    target_length: str = "medium",
-) -> dict:
-    """
-    Core implementation (testable).
-    Convenience endpoint combining extraction and synthesis.
-    
-    Args:
-        image_path: Path to image file
-        seed_text: Optional seed text
-        auto_approve: If true, skips to synthesis; if false, returns interpretation layer
-        target_length: "short", "medium", or "detailed"
-    
-    Returns:
-        If auto_approve=false: extraction result for user review
-        If auto_approve=true: final enhanced_prompt
-    """
-    # Extract everything
-    extraction = extract_impl(image_path, seed_text)
-
-    if not auto_approve:
-        # Return interpretation layer for user review
-        return extraction
-
-    # Auto-approve: synthesize immediately
-    structural_values = extraction["structural_analysis"]["values"]
-    mood_values = extraction["mood_analysis"]["dimensions"]
-    alignment_override = extraction["proposed_alignment"]["register_description"]
-
-    synthesis_result = synthesize_impl(
-        structural_values=structural_values,
-        mood_values=mood_values,
-        alignment_override=alignment_override,
-        seed_text=seed_text,
-        target_length=target_length,
-    )
-
-    return synthesis_result
-
 
 # ============================================================================
 # MCP Tool Endpoints (wrapping testable core)
 # ============================================================================
 
 @mcp.tool()
-def extract(
-    image_path: str,
+def analyze_and_propose(
+    structural_values: dict,
+    mood_values: dict,
     seed_text: Optional[str] = None,
 ) -> dict:
     """
-    Extract compositional structure and mood from image.
+    Analyze pre-extracted compositional parameters and propose alignment.
+    
+    This is the core Grid Dynamics workflow: Claude extracts image parameters,
+    Grid Dynamics proposes how structure and mood interact expressively.
     
     Args:
-        image_path: Path to image file (<10MB)
+        structural_values: Dict with 8 structural parameters (0-1 scale)
+          - edge_tension, asymmetric_balance, negative_space, rhythm,
+          - density, scale_hierarchy, diagonal_dominance, containment
+        mood_values: Dict with 7 mood dimensions (0-1 scale)
+          - melancholy, intimacy, tension, stillness, energy, warmth, unease
         seed_text: Optional seed text describing subject/intent
     
     Returns:
-        Dictionary with structural_analysis, mood_analysis, proposed_alignment,
-        and editable flag set to true for user modification
+        Dictionary with proposed_alignment, conflicts, and editable structural/mood values
     """
-    return extract_impl(image_path, seed_text)
+    return extract_impl(structural_values, mood_values, seed_text)
 
 
 @mcp.tool()
-def synthesize(
+def synthesize_with_modifications(
     structural_values: dict,
     mood_values: dict,
     alignment_override: Optional[str] = None,
@@ -544,9 +448,12 @@ def synthesize(
     """
     Synthesize enhanced prompt from modified structural and mood parameters.
     
+    After reviewing proposed alignment from analyze_and_propose, Claude can
+    modify parameters and use this tool to generate the final compositional prompt.
+    
     Args:
-        structural_values: Modified structural analysis dictionary
-        mood_values: Modified mood analysis dictionary
+        structural_values: Modified structural parameters
+        mood_values: Modified mood parameters
         alignment_override: Optional override for register description
         seed_text: Optional seed text context
         target_length: "short", "medium", or "detailed"
@@ -558,30 +465,6 @@ def synthesize(
         structural_values, mood_values, alignment_override, seed_text, target_length
     )
 
-
-@mcp.tool()
-def analyze_and_synthesize(
-    image_path: str,
-    seed_text: Optional[str] = None,
-    auto_approve: bool = False,
-    target_length: str = "medium",
-) -> dict:
-    """
-    Convenience endpoint combining extraction and synthesis.
-    
-    Args:
-        image_path: Path to image file
-        seed_text: Optional seed text
-        auto_approve: If true, skips to synthesis; if false, returns interpretation layer
-        target_length: "short", "medium", or "detailed"
-    
-    Returns:
-        If auto_approve=false: extraction result for user review
-        If auto_approve=true: final enhanced_prompt
-    """
-    return analyze_and_synthesize_impl(
-        image_path, seed_text, auto_approve, target_length
-    )
 
 
 # ============================================================================
