@@ -267,6 +267,9 @@ Total synthesis: ~1 second
 
 See `grid_dynamics_mcp.py` for implementation details and type definitions.
 
+## Author
+Dal Marsters
+
 ## License
 
 MIT
